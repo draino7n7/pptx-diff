@@ -657,61 +657,101 @@ def extract_presentation(
 # Slide Classification & On-Slide Reference Detection
 # ============================================================================
 
+def _is_objective_heading(text_lower: str, keyword: str) -> bool:
+    """
+    Return True if a slide heading is specifically an Objective heading for `keyword`
+    (e.g. 'learning objective', 'enabling objective', 'terminal objective'),
+    rather than a long sentence or body paragraph that happens to mention it.
+    """
+    cleaned = re.sub(r"[^a-z\s]", " ", text_lower)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if keyword not in cleaned:
+        return False
+    # Heading should be short (<= 8 words) so body paragraphs/questions aren't mistaken for headings
+    return len(cleaned.split()) <= 8
+
+
 def classify_deck_slides(deck: PresentationData) -> None:
     """
     Classify each slide into the standard training deck categories:
     - Title Slide
-    - Course Terminal Objectives
-    - Module Terminal Objectives
-    - Lesson Learning Objective
-    - Section Enabling Objective
-    - References
-    - Knowledge Check
-    - Content
+    - Course Terminal Objectives (max 1 slide, near start of deck)
+    - Module Terminal Objectives (max 1 slide, near start of deck)
+    - Lesson Learning Objective (max 1 slide, near start of deck)
+    - Section Enabling Objective (max 1 slide, near start of deck)
+    - References (max 1 main References slide)
+    - Knowledge Check (any slide throughout the deck headed 'Knowledge Check')
+    - Content (all other slides)
     """
-    terminal_obj_slides: List[SlideData] = []
+    has_course_tlo = False
+    has_module_tlo = False
+    has_lesson_lo = False
+    has_section_eo = False
+    has_references_slide = False
+    generic_tlo_slides: List[SlideData] = []
 
     for slide in deck.slides:
         heading_lower = slide.title.lower()
-        upper_text_lower = "\n".join(
-            tb.normalized_text.lower() for tb in slide.text_boxes if tb.norm_top <= 0.35
-        )
-        all_text_lower = "\n".join(tb.normalized_text.lower() for tb in slide.text_boxes)
+        # Only inspect short text boxes near the very top of the slide (top 25%) as candidate headers
+        upper_headers_lower = [
+            tb.normalized_text.lower()
+            for tb in slide.text_boxes
+            if tb.norm_top <= 0.25 and len(tb.normalized_text.split()) <= 10
+        ]
+        candidate_headings = [heading_lower] + upper_headers_lower
+        first_box_lower = slide.text_boxes[0].normalized_text.lower() if slide.text_boxes else ""
 
-        # 1. Knowledge Check (check slide title and any upper-slide header text box)
-        if "knowledge check" in heading_lower or "knowledge check" in upper_text_lower:
+        # 1. Knowledge Check (can appear throughout the deck)
+        if any("knowledge check" in h for h in candidate_headings if h):
             slide.category = CAT_KNOWLEDGE_CHECK
             continue
 
-        # 2. References Slide
-        heading_clean = re.sub(r"[^a-z\s]", "", heading_lower).strip()
-        upper_lines_clean = [
-            re.sub(r"[^a-z\s]", "", ln).strip()
-            for ln in upper_text_lower.splitlines()
-            if ln.strip()
-        ]
+        # 2. Main References Slide (only 1 main References slide per deck)
         ref_headers = {"reference", "references", "course references", "training references", "reference list"}
-        if heading_clean in ref_headers or any(ln in ref_headers for ln in upper_lines_clean):
+        heading_clean = re.sub(r"[^a-z\s]", "", heading_lower).strip()
+        upper_clean = [re.sub(r"[^a-z\s]", "", h).strip() for h in upper_headers_lower]
+        if not has_references_slide and (
+            heading_clean in ref_headers or any(h in ref_headers for h in upper_clean)
+        ):
             slide.category = CAT_REFERENCES
+            has_references_slide = True
             continue
 
-        # 3. Objectives Slides (spelled out: Terminal Objective(s), Learning Objective(s), Enabling Objective(s))
-        if "terminal objective" in heading_lower or "terminal objective" in all_text_lower:
-            if "course" in heading_lower or "course terminal objective" in all_text_lower:
+        # 3. Dedicated Objective Slides (only near the beginning of the deck, max 1 slide each)
+        # Check if the slide's title/header is an Objective heading
+        is_early_slide = slide.slide_number <= 15
+
+        if is_early_slide and any(_is_objective_heading(h, "terminal objective") for h in candidate_headings):
+            combined_top = " ".join(candidate_headings + [first_box_lower])
+            if "course" in combined_top and not has_course_tlo:
                 slide.category = CAT_COURSE_TLO
-            elif "module" in heading_lower or "module terminal objective" in all_text_lower:
+                has_course_tlo = True
+                continue
+            elif "module" in combined_top and not has_module_tlo:
                 slide.category = CAT_MODULE_TLO
-            else:
+                has_module_tlo = True
+                continue
+            elif len(generic_tlo_slides) < 2:
                 slide.category = CAT_GENERIC_TLO
-                terminal_obj_slides.append(slide)
-            continue
+                generic_tlo_slides.append(slide)
+                continue
 
-        if "enabling objective" in heading_lower or "enabling objective" in all_text_lower:
+        if (
+            is_early_slide
+            and not has_section_eo
+            and any(_is_objective_heading(h, "enabling objective") for h in candidate_headings)
+        ):
             slide.category = CAT_SECTION_EO
+            has_section_eo = True
             continue
 
-        if "learning objective" in heading_lower or "learning objective" in all_text_lower:
+        if (
+            is_early_slide
+            and not has_lesson_lo
+            and any(_is_objective_heading(h, "learning objective") for h in candidate_headings)
+        ):
             slide.category = CAT_LESSON_LO
+            has_lesson_lo = True
             continue
 
         # 4. Title Slide (Slide 1)
@@ -721,12 +761,11 @@ def classify_deck_slides(deck: PresentationData) -> None:
 
         slide.category = CAT_CONTENT
 
-    # If there are two generic "Terminal Objectives" slides near the beginning that didn't
-    # explicitly say "Course" vs "Module", the training hierarchy places Course Terminal
-    # Objectives first and Module Terminal Objectives second.
-    if len(terminal_obj_slides) >= 2:
-        terminal_obj_slides[0].category = CAT_COURSE_TLO
-        terminal_obj_slides[1].category = CAT_MODULE_TLO
+    # If there are generic "Terminal Objectives" slides near the beginning that didn't
+    # explicitly say "Course" vs "Module", assign the first to Course and second to Module.
+    if len(generic_tlo_slides) >= 2:
+        generic_tlo_slides[0].category = CAT_COURSE_TLO
+        generic_tlo_slides[1].category = CAT_MODULE_TLO
 
 
 def build_reference_catalog(deck: PresentationData) -> List[str]:
@@ -759,21 +798,18 @@ def partition_slide_text_boxes(
     """
     Separate each slide's text boxes into:
     - Slide Title
-    - On-Slide Reference Text Boxes (matched against the References slide catalog and bottom-left position)
+    - On-Slide Reference Text Boxes (must be located in the bottom/bottom-left area
+      and match entries from the main References slide, or have an explicit 'Ref:' prefix)
     - Body Content Text Boxes
     """
-    catalog_phrases: List[str] = []
+    catalog_entries_norm: List[str] = []
     catalog_token_sets: List[Set[str]] = []
     all_catalog_tokens: Set[str] = set()
 
     for entry in combined_reference_catalog:
         norm_entry = normalize_for_matching(entry)
-        if len(norm_entry) >= 4:
-            catalog_phrases.append(norm_entry)
-        for part in re.split(r"[,;:\-\(\)]", entry):
-            norm_part = normalize_for_matching(part)
-            if len(norm_part) >= 5:
-                catalog_phrases.append(norm_part)
+        if len(norm_entry) >= 6:
+            catalog_entries_norm.append(norm_entry)
         t_set = tokenize_reference_text(entry)
         if t_set:
             catalog_token_sets.append(t_set)
@@ -800,46 +836,47 @@ def partition_slide_text_boxes(
 
             is_ref_box = False
 
-            # Check 1: Explicit "Ref:" / "Reference:" / "References:" prefix
+            # Position check: On-slide reference boxes sit near the bottom / bottom-left of the slide
+            # and are small citation boxes (not large body placeholders starting in the top half).
+            is_bottom_box = (tb.norm_top >= 0.58) or ((tb.norm_top >= 0.45) and (tb.norm_top + tb.norm_height >= 0.75))
+            is_not_full_body = tb.norm_height <= 0.38
+            is_bottom_left_region = tb.norm_left <= 0.65
+
+            # Check 1: Explicit "Ref:" / "Reference:" / "References:" prefix in a short/bottom box
             if re.match(r"^(refs?|references?|sources?)\s*[:\-]", box_text.strip(), re.IGNORECASE):
-                is_ref_box = True
+                if is_bottom_box or len(box_text.splitlines()) <= 4:
+                    is_ref_box = True
 
-            # Check 2: Position + content match against the main References slide catalog
-            is_bottom_area = (tb.norm_top >= 0.55) or ((tb.norm_top + tb.norm_height) >= 0.72)
-            is_bottom_left_favor = tb.norm_left <= 0.65
-
-            if not is_ref_box and catalog_phrases:
+            # Check 2: Text box is in the bottom/bottom-left region AND matches the main References slide
+            if not is_ref_box and is_bottom_box and is_not_full_body and is_bottom_left_region and catalog_entries_norm:
                 box_lines = [normalize_for_matching(ln) for ln in box_text.splitlines() if ln.strip()]
                 matched_lines = 0
                 for ln in box_lines:
-                    if len(ln) < 4:
+                    if len(ln) < 5:
                         continue
-                    for phrase in catalog_phrases:
-                        if (len(ln) >= 5 and ln in phrase) or (len(phrase) >= 5 and phrase in ln):
+                    for ref_entry in catalog_entries_norm:
+                        if (len(ln) >= 6 and ln in ref_entry) or (len(ref_entry) >= 6 and ref_entry in ln):
                             matched_lines += 1
                             break
-                        else:
-                            if is_bottom_area and len(ln) >= 6 and len(phrase) >= 6:
-                                if difflib.SequenceMatcher(None, ln, phrase).ratio() >= 0.72:
-                                    matched_lines += 1
-                                    break
+                        if difflib.SequenceMatcher(None, ln, ref_entry).ratio() >= 0.70:
+                            matched_lines += 1
+                            break
 
                 if box_lines and (matched_lines / len(box_lines)) >= 0.5:
-                    if len(box_lines) <= 6 or is_bottom_area:
-                        is_ref_box = True
+                    is_ref_box = True
 
-                if not is_ref_box and is_bottom_area and is_bottom_left_favor:
+                if not is_ref_box:
                     box_tokens = tokenize_reference_text(box_text)
                     if box_tokens:
-                        overlap = box_tokens & all_catalog_tokens
-                        overlap_ratio = len(overlap) / len(box_tokens)
-                        if overlap_ratio >= 0.50:
-                            is_ref_box = True
-                        else:
-                            for ref_tokens in catalog_token_sets:
-                                if ref_tokens and len(box_tokens & ref_tokens) / min(len(box_tokens), len(ref_tokens)) >= 0.60:
-                                    is_ref_box = True
-                                    break
+                        for ref_tokens in catalog_token_sets:
+                            if not ref_tokens:
+                                continue
+                            shared = box_tokens & ref_tokens
+                            # Require at least 2 shared meaningful tokens (or 1 if the reference is a single code)
+                            min_req = 1 if len(ref_tokens) == 1 else 2
+                            if len(shared) >= min_req and (len(shared) / min(len(box_tokens), len(ref_tokens))) >= 0.60:
+                                is_ref_box = True
+                                break
 
             tb.is_reference = is_ref_box
             if is_ref_box:
@@ -1309,9 +1346,10 @@ def build_option_b_summary(res: DeckComparisonResult) -> str:
         obj_strs = [f"{cat_name} ({format_slide_list(s_list)})" for cat_name, s_list in by_cat.items()]
         obj_ref_parts.append(", ".join(obj_strs))
 
-    all_ref_slides = sorted(set(res.main_ref_slides_changed + res.on_slide_refs_changed))
-    if all_ref_slides:
-        obj_ref_parts.append(f"References ({format_slide_list(all_ref_slides)})")
+    if res.main_ref_slides_changed:
+        obj_ref_parts.append(f"References slide ({format_slide_list(res.main_ref_slides_changed)})")
+    if res.on_slide_refs_changed:
+        obj_ref_parts.append(f"Slide refs ({format_slide_list(res.on_slide_refs_changed)})")
 
     if obj_ref_parts:
         lines.append(f"Objectives/Refs: {' & '.join(obj_ref_parts)} updated")
