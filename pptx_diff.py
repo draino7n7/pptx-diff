@@ -793,96 +793,19 @@ def tokenize_reference_text(text: str) -> Set[str]:
 
 def partition_slide_text_boxes(
     deck: PresentationData,
-    combined_reference_catalog: List[str],
+    combined_reference_catalog: Optional[List[str]] = None,
 ) -> None:
     """
-    Separate each slide's text boxes into:
-    - Slide Title
-    - On-Slide Reference Text Boxes (must be located in the bottom/bottom-left area
-      and match entries from the main References slide, or have an explicit 'Ref:' prefix)
-    - Body Content Text Boxes
+    Populate slide.body_text_items with all non-title text boxes on each slide
+    (including any on-slide reference boxes so changes to them are tracked under
+    slide content changes).
     """
-    catalog_entries_norm: List[str] = []
-    catalog_token_sets: List[Set[str]] = []
-    all_catalog_tokens: Set[str] = set()
-
-    for entry in combined_reference_catalog:
-        norm_entry = normalize_for_matching(entry)
-        if len(norm_entry) >= 6:
-            catalog_entries_norm.append(norm_entry)
-        t_set = tokenize_reference_text(entry)
-        if t_set:
-            catalog_token_sets.append(t_set)
-            all_catalog_tokens.update(t_set)
-
     for slide in deck.slides:
         slide.body_text_items = []
         slide.on_slide_references = []
-
-        if slide.category == CAT_REFERENCES:
-            for tb in slide.text_boxes:
-                if not tb.is_title:
-                    slide.body_text_items.append(tb.normalized_text)
-            continue
-
         for tb in slide.text_boxes:
-            if tb.is_title:
-                continue
-
-            box_text = tb.normalized_text
-            box_norm = normalize_for_matching(box_text)
-            if not box_norm:
-                continue
-
-            is_ref_box = False
-
-            # Position check: On-slide reference boxes sit near the bottom / bottom-left of the slide
-            # and are small citation boxes (not large body placeholders starting in the top half).
-            is_bottom_box = (tb.norm_top >= 0.58) or ((tb.norm_top >= 0.45) and (tb.norm_top + tb.norm_height >= 0.75))
-            is_not_full_body = tb.norm_height <= 0.38
-            is_bottom_left_region = tb.norm_left <= 0.65
-
-            # Check 1: Explicit "Ref:" / "Reference:" / "References:" prefix in a short/bottom box
-            if re.match(r"^(refs?|references?|sources?)\s*[:\-]", box_text.strip(), re.IGNORECASE):
-                if is_bottom_box or len(box_text.splitlines()) <= 4:
-                    is_ref_box = True
-
-            # Check 2: Text box is in the bottom/bottom-left region AND matches the main References slide
-            if not is_ref_box and is_bottom_box and is_not_full_body and is_bottom_left_region and catalog_entries_norm:
-                box_lines = [normalize_for_matching(ln) for ln in box_text.splitlines() if ln.strip()]
-                matched_lines = 0
-                for ln in box_lines:
-                    if len(ln) < 5:
-                        continue
-                    for ref_entry in catalog_entries_norm:
-                        if (len(ln) >= 6 and ln in ref_entry) or (len(ref_entry) >= 6 and ref_entry in ln):
-                            matched_lines += 1
-                            break
-                        if difflib.SequenceMatcher(None, ln, ref_entry).ratio() >= 0.70:
-                            matched_lines += 1
-                            break
-
-                if box_lines and (matched_lines / len(box_lines)) >= 0.5:
-                    is_ref_box = True
-
-                if not is_ref_box:
-                    box_tokens = tokenize_reference_text(box_text)
-                    if box_tokens:
-                        for ref_tokens in catalog_token_sets:
-                            if not ref_tokens:
-                                continue
-                            shared = box_tokens & ref_tokens
-                            # Require at least 2 shared meaningful tokens (or 1 if the reference is a single code)
-                            min_req = 1 if len(ref_tokens) == 1 else 2
-                            if len(shared) >= min_req and (len(shared) / min(len(box_tokens), len(ref_tokens))) >= 0.60:
-                                is_ref_box = True
-                                break
-
-            tb.is_reference = is_ref_box
-            if is_ref_box:
-                slide.on_slide_references.append(box_text)
-            else:
-                slide.body_text_items.append(box_text)
+            if not tb.is_title and tb.normalized_text:
+                slide.body_text_items.append(tb.normalized_text)
 
 
 # ============================================================================

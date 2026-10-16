@@ -318,8 +318,9 @@ class TestPptxDiff(unittest.TestCase):
         self.assertIn("Images changed: Slides 7, 8", summary_text)
         self.assertIn("Section Enabling Objective (Slide 5)", summary_text)
         self.assertIn("References slide (Slide 6)", summary_text)
-        self.assertIn("Slide refs (Slides 7, 8)", summary_text)
+        self.assertNotIn("Slide refs", summary_text)
         self.assertIn("Knowledge Checks: Updated on Slide 9", summary_text)
+        self.assertIn("Slide text changed (7)", summary_text)
         self.assertIn("Speaker notes changed (7, 9)", summary_text)
 
         # Verify v1 -> v2 findings:
